@@ -284,6 +284,7 @@ def main():
     interval = 2.0  # balanced cadence
     last_instr = None
     aligned_counter = 0  # consecutive aligned confirmations
+    phase = 'acquire'  # first ensure user is fully in frame
 
     while True:
         ret, frame = cap.read()
@@ -310,15 +311,89 @@ def main():
                 eyes = eye_cascade.detectMultiScale(roi_gray, 1.1, 3)
             except Exception:
                 eyes = []
-            frontal_ok = len(eyes) >= 1
+            # Consider the face frontal only when both eyes are visible
+            frontal_ok = len(eyes) >= 2
 
             now = time.time()
+
+            # --- Stage 1: Ensure the face is fully inside the frame before target guidance ---
+            w_frame, h_frame = frame.shape[1], frame.shape[0]
+            safe_margin = int(0.06 * min(w_frame, h_frame))
+            fully_inside = (
+                fx > safe_margin and fy > safe_margin and
+                fx + fw < w_frame - safe_margin and fy + fh < h_frame - safe_margin
+            )
+            large_enough = (fw >= 0.15 * w_frame) or (fh >= 0.15 * h_frame)
+
+            if phase == 'acquire':
+                if now - last_talk > interval:
+                    if not fully_inside or not large_enough:
+                        nudges = []
+                        if fx <= safe_margin:
+                            nudges.append("Move right.")
+                        if fx + fw >= w_frame - safe_margin:
+                            nudges.append("Move left.")
+                        if fy <= safe_margin:
+                            nudges.append("Move down.")
+                        if fy + fh >= h_frame - safe_margin:
+                            nudges.append("Move up.")
+                        if large_enough is False:
+                            nudges.append("Move closer to the camera.")
+
+                        instr = " ".join(nudges) or "Please move the camera until your whole face is in the frame."
+                        if instr != last_instr:
+                            speak(instr)
+                            last_instr = instr
+                            last_talk = now
+                    else:
+                        speak(f"Great, I can see you clearly. Now move to {_section_label(target)}.")
+                        phase = 'target'
+                        last_instr = None
+                        last_talk = now
+
+                # Skip target guidance until acquisition is complete
+                continue
+
+            # If we had a face and then lost good framing, fall back to acquire
+            if phase == 'target' and (not fully_inside or not large_enough):
+                if now - last_talk > interval:
+                    speak("You're partially out of view. Re-center yourself, then we'll continue.")
+                    last_talk = now
+                    last_instr = None
+                phase = 'acquire'
+                continue
+
+            # --- Stage 2: Target-specific guidance ---
             if now - last_talk > interval:
                 instr, is_aligned, _is_near = guidance(
                     face_cx, face_cy, current, target,
-                    (frame.shape[1], frame.shape[0]),
+                    (w_frame, h_frame),
                     (x1, y1, x2, y2, cx, cy),
                 )
+
+                # When inside the target section but face is angled, ask for head rotation
+                inside_target = (
+                    (target == 'c' and x1 <= face_cx <= x2 and y1 <= face_cy <= y2) or
+                    (target == 'tl' and face_cx < cx and face_cy < cy) or
+                    (target == 'tr' and face_cx >= cx and face_cy < cy) or
+                    (target == 'bl' and face_cx < cx and face_cy >= cy) or
+                    (target == 'br' and face_cx >= cx and face_cy >= cy)
+                )
+
+                if inside_target and not frontal_ok:
+                    rotate_instr = None
+                    if len(eyes) == 1:
+                        ex, ey, ew, eh = eyes[0]
+                        eye_center_x = ex + ew // 2
+                        if eye_center_x < fw // 2:
+                            rotate_instr = "Rotate your head slightly to your right."
+                        else:
+                            rotate_instr = "Rotate your head slightly to your left."
+                    elif len(eyes) == 0:
+                        rotate_instr = "Turn your face toward the camera until both eyes are visible."
+
+                    if rotate_instr:
+                        instr = rotate_instr
 
                 # Avoid repeating the exact same instruction too frequently
                 if instr != last_instr or is_aligned:
@@ -326,6 +401,7 @@ def main():
                     last_instr = instr
                     last_talk = now
 
+                # Require both alignment and frontal face before auto-capture
                 if is_aligned and frontal_ok:
                     aligned_counter += 1
                     if aligned_counter >= 2:
@@ -336,6 +412,13 @@ def main():
                         break
                 else:
                     aligned_counter = 0
+        else:
+            # No face detected at all — guide the user to enter the frame first
+            now = time.time()
+            if now - last_talk > interval:
+                speak("I can't see your face. Move the camera slowly left, right, up, and down until I can see you.")
+                last_talk = now
+                last_instr = None
 
         cv2.imshow("Guided Camera", frame)
         if cv2.waitKey(1) & 0xFF == ord("q"):
