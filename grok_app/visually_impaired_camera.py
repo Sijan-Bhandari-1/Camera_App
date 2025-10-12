@@ -7,6 +7,7 @@ import queue
 import os
 import sys
 import re
+import subprocess
 
 # ------------------------------
 # SPEECH ENGINE
@@ -55,9 +56,10 @@ def _init_tts_engine():
         except Exception as e:
             last_error = e
             continue
-    # If all drivers fail, re-raise last error
+    # If all drivers fail, return None so caller can fallback gracefully
     if last_error:
-        raise last_error
+        print("[DEBUG] TTS engine initialization failed; will use CLI fallbacks if available:", last_error)
+        return None
     return pyttsx3.init()
 
 engine = _init_tts_engine()
@@ -68,11 +70,32 @@ def speech_worker():
         if text is None:
             break
         print(f"[DEBUG] Speaking: {text}")
-        try:
-            engine.say(text)
-            engine.runAndWait()
-        except Exception as e:
-            print("[DEBUG] Speech error:", e)
+        # Try pyttsx3 first, but allow None and exceptions to fall back
+        ran = False
+        if engine is not None:
+            try:
+                engine.say(text)
+                engine.runAndWait()
+                ran = True
+            except Exception as e:
+                print("[DEBUG] Speech error:", e)
+        if not ran:
+            # Attempt CLI-based fallbacks for TTS if available
+            try:
+                if sys.platform == "darwin":
+                    subprocess.run(["say", text], timeout=10)
+                elif sys.platform.startswith("linux"):
+                    # Try espeak-ng, espeak, then spd-say
+                    for cmd in (["espeak-ng", text], ["espeak", text], ["spd-say", text]):
+                        try:
+                            subprocess.run(cmd, timeout=10)
+                            ran = True
+                            break
+                        except Exception:
+                            continue
+                # On Windows there is no simple CLI fallback; rely on pyttsx3 drivers
+            except Exception as _:
+                pass
         speech_queue.task_done()
 
 threading.Thread(target=speech_worker, daemon=True).start()
@@ -291,21 +314,25 @@ def main():
         if not ret:
             break
         frame = cv2.flip(frame, 1)
-        photo_frame = frame.copy()  # save a clean copy for the selfie
+        photo_frame = frame.copy()  # clean frame for detection and selfie
 
+        # Draw overlays only on the display frame; run detection on the clean frame
         frame, (x1, y1, x2, y2, cx, cy) = draw_layout(frame, target)
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(gray, 1.2, 5)
+
+        gray_clean = cv2.cvtColor(photo_frame, cv2.COLOR_BGR2GRAY)
+        # Slightly more sensitive scale factor; ignore tiny detections
+        faces = face_cascade.detectMultiScale(gray_clean, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40))
 
         if len(faces) > 0:
-            (fx, fy, fw, fh) = faces[0]
+            # Prefer the largest face if multiple are found
+            (fx, fy, fw, fh) = max(faces, key=lambda r: r[2] * r[3])
             cv2.rectangle(frame, (fx, fy), (fx + fw, fy + fh), (0, 255, 0), 2)
             face_cx = fx + fw // 2
             face_cy = fy + fh // 2
             current = detect_section(face_cx, face_cy, frame.shape[1], frame.shape[0], x1, y1, x2, y2, cx, cy)
 
             # Simple frontal check using eyes detection
-            roi_gray = gray[fy:fy + fh, fx:fx + fw]
+            roi_gray = gray_clean[fy:fy + fh, fx:fx + fw]
             eyes = []
             try:
                 eyes = eye_cascade.detectMultiScale(roi_gray, 1.1, 3)
