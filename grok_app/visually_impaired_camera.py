@@ -5,20 +5,62 @@ import time
 import threading
 import queue
 import os
+import sys
+import re
 
 # ------------------------------
 # SPEECH ENGINE
 # ------------------------------
 speech_queue = queue.Queue()
-engine = pyttsx3.init(driverName='sapi5')
-voices = engine.getProperty('voices')
-for v in voices:
-    if 'male' in v.name.lower():
-        engine.setProperty('voice', v.id)
-        break
 
-engine.setProperty('rate', 170)
-engine.setProperty('volume', 1.0)
+def _init_tts_engine():
+    """Initialize pyttsx3 engine with cross-platform driver fallbacks.
+
+    - Windows: sapi5
+    - macOS: nsss
+    - Linux: espeak/espeak-ng (falls back to default)
+    """
+    driver_candidates = []
+    if sys.platform.startswith("win"):
+        driver_candidates = ["sapi5", None]
+    elif sys.platform == "darwin":
+        driver_candidates = ["nsss", None]
+    else:
+        # Assume Linux
+        driver_candidates = ["espeak", "espeak-ng", None]
+
+    last_error = None
+    for driver in driver_candidates:
+        try:
+            engine = pyttsx3.init(driverName=driver) if driver else pyttsx3.init()
+            engine.setProperty("rate", 170)
+            engine.setProperty("volume", 1.0)
+
+            # Prefer an English voice if available, otherwise keep default
+            try:
+                voices = engine.getProperty("voices")
+                chosen_voice_id = None
+                for v in voices:
+                    name_lower = (getattr(v, "name", "") or "").lower()
+                    langs = getattr(v, "languages", []) or []
+                    if any("en" in str(lang).lower() for lang in langs) or "english" in name_lower:
+                        chosen_voice_id = v.id
+                        break
+                if chosen_voice_id:
+                    engine.setProperty("voice", chosen_voice_id)
+            except Exception:
+                pass
+
+            return engine
+        except Exception as e:
+            last_error = e
+            continue
+    # If all drivers fail, re-raise last error
+    if last_error:
+        raise last_error
+    return pyttsx3.init()
+
+engine = _init_tts_engine()
 
 def speech_worker():
     while True:
@@ -45,13 +87,13 @@ def speak(text):
 recognizer = sr.Recognizer()
 mic = sr.Microphone()
 
-def listen():
+def listen(phrase_time_limit: int = 5) -> str:
+    # Do not speak while the microphone is open to avoid feedback
     with mic as source:
-        recognizer.adjust_for_ambient_noise(source, duration=1)
-        speak("Listening for your choice...")
-        print("[DEBUG] Listening for choice...")
+        recognizer.adjust_for_ambient_noise(source, duration=0.8)
+        print("[DEBUG] Listening for voice input...")
         try:
-            audio = recognizer.listen(source, phrase_time_limit=5)
+            audio = recognizer.listen(source, phrase_time_limit=phrase_time_limit)
         except Exception as e:
             print("[DEBUG] Audio capture failed:", e)
             return ""
@@ -59,38 +101,61 @@ def listen():
         text = recognizer.recognize_google(audio).lower()
         print(f"[DEBUG] Heard: {text}")
         return text
-    except:
-        speak("Sorry, I could not understand.")
+    except Exception:
+        speak("I did not catch that. Please say again.")
         return ""
 
-def get_voice_choice():
-    speak("Please say your target section: top left, top right, bottom left, bottom right, or center.")
+def _normalize_text(s: str) -> str:
+    s = s.lower()
+    s = re.sub(r"[^a-z\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _section_label(code: str) -> str:
+    return {
+        "tl": "Top Left",
+        "tr": "Top Right",
+        "bl": "Bottom Left",
+        "br": "Bottom Right",
+        "c": "Center",
+    }.get(code, "Center")
+
+def get_voice_choice() -> str:
+    speak("Welcome. Please select your target section. The options are: Top Left, Top Right, Bottom Left, Bottom Right, or Center.")
     for attempt in range(3):
-        response = listen()
-        if "top left" in response:
-            speak("You selected top left.")
-            return "tl"
-        elif "top right" in response:
-            speak("You selected top right.")
-            return "tr"
-        elif "bottom left" in response:
-            speak("You selected bottom left.")
-            return "bl"
-        elif "bottom right" in response:
-            speak("You selected bottom right.")
-            return "br"
-        elif "center" in response:
-            speak("You selected center.")
-            return "c"
+        response_raw = listen()
+        response = _normalize_text(response_raw)
+        if not response:
+            continue
+
+        if "top left" in response or "upper left" in response or "left top" in response:
+            choice = "tl"
+        elif "top right" in response or "upper right" in response or "right top" in response:
+            choice = "tr"
+        elif "bottom left" in response or "lower left" in response or "left bottom" in response:
+            choice = "bl"
+        elif "bottom right" in response or "lower right" in response or "right bottom" in response:
+            choice = "br"
+        elif "center" in response or "centre" in response or "middle" in response:
+            choice = "c"
         else:
-            speak("I did not catch that. Please try again.")
-    speak("Defaulting to center.")
+            speak("I did not catch that. Please say again.")
+            continue
+
+        speak(f"Target section selected: {_section_label(choice)}.")
+        return choice
+
+    # Fallback to center after several attempts
+    speak("Target section selected: Center.")
     return "c"
 
 # ------------------------------
 # LAYOUT + DETECTION
 # ------------------------------
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_eye_tree_eyeglasses.xml")
+if eye_cascade.empty():
+    eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_eye.xml")
 
 def draw_layout(frame, selected):
     h, w, _ = frame.shape
@@ -142,19 +207,69 @@ def detect_section(face_cx, face_cy, w, h, x1, y1, x2, y2, cx, cy):
     else:
         return "br"
 
-def guidance(current, target):
-    if current == target:
-        return "Perfect! Face aligned."
-    moves = []
-    if current in ["tl", "bl"] and target in ["tr", "br", "c"]:
-        moves.append("move right")
-    elif current in ["tr", "br"] and target in ["tl", "bl", "c"]:
-        moves.append("move left")
-    if current in ["tl", "tr"] and target in ["bl", "br", "c"]:
-        moves.append("move down")
-    elif current in ["bl", "br"] and target in ["tl", "tr", "c"]:
-        moves.append("move up")
-    return " and ".join(moves)
+def _target_center(selected: str, w: int, h: int, cx: int, cy: int, x1: int, y1: int, x2: int, y2: int):
+    if selected == "tl":
+        return (cx // 2, cy // 2)
+    if selected == "tr":
+        return (cx + (w - cx) // 2, cy // 2)
+    if selected == "bl":
+        return (cx // 2, cy + (h - cy) // 2)
+    if selected == "br":
+        return (cx + (w - cx) // 2, cy + (h - cy) // 2)
+    # center
+    return ((x1 + x2) // 2, (y1 + y2) // 2)
+
+def guidance(face_cx: int, face_cy: int, current: str, target: str, dims, layout_rect) -> tuple[str, bool, bool]:
+    """Return (instruction, aligned, near).
+
+    - instruction: what to speak next
+    - aligned: True when inside target and sufficiently centered
+    - near: True when close enough to say "Good, almost there."
+    """
+    w, h = dims
+    x1, y1, x2, y2, cx, cy = layout_rect
+    tx, ty = _target_center(target, w, h, cx, cy, x1, y1, x2, y2)
+    dx = tx - face_cx
+    dy = ty - face_cy
+    dist = (dx * dx + dy * dy) ** 0.5
+
+    base_unit = 0.08 * min(w, h)  # guidance sensitivity
+    near_unit = 0.04 * min(w, h)
+
+    # Determine alignment: inside target section and close to target center
+    in_center_box = (x1 <= face_cx <= x2 and y1 <= face_cy <= y2)
+    in_quadrant = (
+        (target == "tl" and face_cx < cx and face_cy < cy) or
+        (target == "tr" and face_cx >= cx and face_cy < cy) or
+        (target == "bl" and face_cx < cx and face_cy >= cy) or
+        (target == "br" and face_cx >= cx and face_cy >= cy)
+    )
+    inside_target = in_center_box if target == "c" else in_quadrant
+
+    aligned = inside_target and dist <= near_unit
+    near = inside_target and not aligned and dist <= base_unit
+
+    if aligned:
+        return ("Good. Hold steady.", True, False)
+
+    if near:
+        return ("Good, almost there.", False, True)
+
+    # Directional guidance with nuance
+    horizontal = ""
+    vertical = ""
+    if abs(dx) > base_unit:
+        horizontal = "Move right." if dx > 0 else "Move left."
+    elif abs(dx) > near_unit:
+        horizontal = "Move slightly to the right." if dx > 0 else "Move slightly to the left."
+
+    if abs(dy) > base_unit:
+        vertical = "Move down." if dy > 0 else "Move up."
+    elif abs(dy) > near_unit:
+        vertical = "Move slightly down." if dy > 0 else "Move slightly up."
+
+    instr = " ".join([p for p in (vertical, horizontal) if p]) or "Please move toward the target section."
+    return (instr, False, False)
 
 # ------------------------------
 # MAIN LOGIC (Continuous Guidance + Auto Selfie)
@@ -165,15 +280,17 @@ def main():
     cv2.namedWindow("Guided Camera", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("Guided Camera", 1280, 720)
 
-    last_talk = 0
-    interval = 2.5
-    aligned_counter = 0  # count consecutive perfect frames
+    last_talk = 0.0
+    interval = 2.0  # balanced cadence
+    last_instr = None
+    aligned_counter = 0  # consecutive aligned confirmations
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
         frame = cv2.flip(frame, 1)
+        photo_frame = frame.copy()  # save a clean copy for the selfie
 
         frame, (x1, y1, x2, y2, cx, cy) = draw_layout(frame, target)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -186,18 +303,35 @@ def main():
             face_cy = fy + fh // 2
             current = detect_section(face_cx, face_cy, frame.shape[1], frame.shape[0], x1, y1, x2, y2, cx, cy)
 
+            # Simple frontal check using eyes detection
+            roi_gray = gray[fy:fy + fh, fx:fx + fw]
+            eyes = []
+            try:
+                eyes = eye_cascade.detectMultiScale(roi_gray, 1.1, 3)
+            except Exception:
+                eyes = []
+            frontal_ok = len(eyes) >= 1
+
             now = time.time()
             if now - last_talk > interval:
-                instr = guidance(current, target)
-                speak(instr)
-                last_talk = now
+                instr, is_aligned, _is_near = guidance(
+                    face_cx, face_cy, current, target,
+                    (frame.shape[1], frame.shape[0]),
+                    (x1, y1, x2, y2, cx, cy),
+                )
 
-                if instr == "Perfect! Face aligned.":
+                # Avoid repeating the exact same instruction too frequently
+                if instr != last_instr or is_aligned:
+                    speak(instr)
+                    last_instr = instr
+                    last_talk = now
+
+                if is_aligned and frontal_ok:
                     aligned_counter += 1
                     if aligned_counter >= 2:
-                        speak("Do not move now. Capturing your selfie.")
+                        speak("Stop moving. Capturing your selfie.")
                         img_name = f"selfie_{int(time.time())}.jpg"
-                        cv2.imwrite(img_name, frame)
+                        cv2.imwrite(img_name, photo_frame)
                         speak("Selfie captured successfully. Camera closing.")
                         break
                 else:
