@@ -4,6 +4,7 @@ import speech_recognition as sr
 import time
 import re
 import os
+import sys
 import mediapipe as mp
 import tkinter as tk
 import threading
@@ -14,30 +15,47 @@ INSTRUCTION_COOLDOWN = 3.5   # seconds between spoken instructions
 MIN_STABLE_ROUNDS = 3        # consecutive aligned frames before capture
 WINDOW_SCALE = 0.85          # fraction of screen for window
 
+# Power/Performance tuning
+TARGET_FPS = 15              # cap end-to-end processing rate
+CAPTURE_WIDTH = 640          # camera capture width
+CAPTURE_HEIGHT = 480         # camera capture height
+PROCESS_MAX_WIDTH = 400      # downscale width for FaceMesh processing
+
 # Distance thresholds
 DIST_NEAR = 0.10
 DIST_FAR = 0.04
 
 # ------------------------------
-# TTS setup for Windows (SAPI5)
+# TTS setup (cross-platform with fallback)
 # ------------------------------
-engine = pyttsx3.init("sapi5")
-engine.setProperty('rate', 160)
-engine.setProperty('volume', 1.0)
-
-# Pick a Windows voice
-voices = engine.getProperty('voices')
-for v in voices:
-    if "Zira" in v.name or "David" in v.name:
-        engine.setProperty('voice', v.id)
-        break
+try:
+    if sys.platform.startswith("win"):
+        engine = pyttsx3.init("sapi5")
+    elif sys.platform == "darwin":
+        engine = pyttsx3.init("nsss")
+    else:
+        engine = pyttsx3.init()  # espeak on Linux
+    engine.setProperty('rate', 160)
+    engine.setProperty('volume', 1.0)
+    # Prefer familiar voices on Windows, if available
+    if sys.platform.startswith("win"):
+        voices = engine.getProperty('voices')
+        for v in voices:
+            if "Zira" in v.name or "David" in v.name:
+                engine.setProperty('voice', v.id)
+                break
+except Exception:
+    engine = None
     
 def speak(text: str):
     """Speak text immediately (main thread)."""
-    if text:
-        print(f"[INSTRUCTION]: {text}")
-        engine.say(text)
-        engine.runAndWait()
+    if not text:
+        return
+    print(f"[INSTRUCTION]: {text}")
+    if engine is None:
+        return
+    engine.say(text)
+    engine.runAndWait()
 
 # ------------------------------
 # Speech recognition for target selection
@@ -170,10 +188,25 @@ def get_head_pose_instructions(landmarks, face_bbox, w,h):
 # Main loop
 # ------------------------------
 def main():
+    # Reduce OpenCV CPU usage
+    try:
+        cv2.setUseOptimized(True)
+        cv2.setNumThreads(1)
+    except Exception:
+        pass
+
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         speak("Camera not available.")
         return
+    # Apply capture constraints to lower sensor and decode power
+    try:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAPTURE_WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAPTURE_HEIGHT)
+        cap.set(cv2.CAP_PROP_FPS, TARGET_FPS)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    except Exception:
+        pass
     os.makedirs("selfies", exist_ok=True)
 
     # Screen setup
@@ -200,21 +233,29 @@ def main():
 
         last_instruction_time = 0.0
         aligned_history = []
+        min_frame_interval = 1.0 / max(1, TARGET_FPS)
 
         while True:
+            iter_start = time.time()
             ret, frame = cap.read()
             if not ret:
                 speak("Lost camera feed.")
                 break
             frame = cv2.flip(frame, 1)
-            photo_frame = frame.copy()
             h, w, _ = frame.shape
 
             frame, layout_rect = draw_full_grid(frame, target)
             x1,y1,x2,y2,cx,cy = layout_rect
 
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = face_mesh.process(rgb)
+            # Downscale before heavy processing to reduce CPU usage
+            process_bgr = frame
+            if w > PROCESS_MAX_WIDTH:
+                scale = PROCESS_MAX_WIDTH / float(w)
+                new_w = int(w * scale)
+                new_h = int(h * scale)
+                process_bgr = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            process_rgb = cv2.cvtColor(process_bgr, cv2.COLOR_BGR2RGB)
+            results = face_mesh.process(process_rgb)
 
             now = time.time()
             can_generate = (now - last_instruction_time) >= INSTRUCTION_COOLDOWN
@@ -267,7 +308,14 @@ def main():
                     speak("Perfect! Hold still. Capturing in three, two, one.")
                     time.sleep(2.5)
                     img_name = f"selfies/selfie_{int(time.time())}.jpg"
-                    selfie_crop = photo_frame[y1:y2, x1:x2]
+                    # Capture a fresh, clean frame for saving (no overlays)
+                    ret_save, save_frame = cap.read()
+                    if ret_save:
+                        save_frame = cv2.flip(save_frame, 1)
+                        selfie_crop = save_frame[y1:y2, x1:x2]
+                    else:
+                        # Fallback to current frame region (may contain overlays)
+                        selfie_crop = frame[y1:y2, x1:x2]
                     cv2.imwrite(img_name, selfie_crop)
                     speak("Selfie captured successfully. Camera closing.")
                     time.sleep(2.0)
@@ -279,7 +327,11 @@ def main():
                     last_instruction_time = now
 
             cv2.imshow("Guided Camera", frame)
-            if cv2.waitKey(1) & 0xFF==ord("q"):
+            # Throttle to target FPS using waitKey delay
+            elapsed = time.time() - iter_start
+            remaining = max(0.0, min_frame_interval - elapsed)
+            wait_ms = max(1, int(remaining * 1000))
+            if cv2.waitKey(wait_ms) & 0xFF==ord("q"):
                 speak("Application closed by user.")
                 break
 
